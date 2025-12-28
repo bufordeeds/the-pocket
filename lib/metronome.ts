@@ -11,14 +11,19 @@ export interface MetronomeState {
   bpm: number;
   startTime: number | null;
   currentBeat: number;
+  isCountingIn: boolean;
+  countInBeatsRemaining: number;
 }
 
 export interface MetronomeCallbacks {
   onBeat?: (beatNumber: number, beatTime: number) => void;
+  onCountIn?: (beatsRemaining: number) => void;
+  onCountInComplete?: () => void;
 }
 
 const TICK_INTERVAL_MS = 10; // Check every 10ms for beat timing
 const AUDIO_LOOKAHEAD_MS = 50; // Schedule audio slightly ahead
+const DEFAULT_COUNT_IN_BEATS = 4;
 
 export class Metronome {
   private state: MetronomeState = {
@@ -26,6 +31,8 @@ export class Metronome {
     bpm: 90,
     startTime: null,
     currentBeat: 0,
+    isCountingIn: false,
+    countInBeatsRemaining: 0,
   };
 
   private tickInterval: ReturnType<typeof setInterval> | null = null;
@@ -33,9 +40,19 @@ export class Metronome {
   private callbacks: MetronomeCallbacks = {};
   private nextScheduledBeat: number = 0;
   private audioSource: AVPlaybackSource;
+  private countInBeats: number = DEFAULT_COUNT_IN_BEATS;
+  private audioLatencyMs: number = 0;
 
   constructor(audioSource: AVPlaybackSource) {
     this.audioSource = audioSource;
+  }
+
+  setAudioLatency(latencyMs: number): void {
+    this.audioLatencyMs = latencyMs;
+  }
+
+  getAudioLatency(): number {
+    return this.audioLatencyMs;
   }
 
   async initialize(): Promise<void> {
@@ -65,6 +82,19 @@ export class Metronome {
     return this.state.startTime;
   }
 
+  /**
+   * Get the effective start time adjusted for audio latency.
+   * This is what tap times should be compared against.
+   */
+  getAdjustedStartTime(): number | null {
+    if (this.state.startTime === null) return null;
+    return this.state.startTime + this.audioLatencyMs;
+  }
+
+  isCountingIn(): boolean {
+    return this.state.isCountingIn;
+  }
+
   getBeatIntervalMs(): number {
     return bpmToIntervalMs(this.state.bpm);
   }
@@ -77,16 +107,19 @@ export class Metronome {
     if (this.state.isPlaying) return;
 
     this.state.isPlaying = true;
-    this.state.currentBeat = 0;
-    this.nextScheduledBeat = 0;
+    this.state.currentBeat = -this.countInBeats; // Negative beats for count-in
+    this.state.isCountingIn = true;
+    this.state.countInBeatsRemaining = this.countInBeats;
+    this.nextScheduledBeat = -this.countInBeats;
 
-    // Start time is set to align with first beat
-    this.state.startTime = performance.now();
+    // Start time aligned so beat 0 happens after count-in
+    const now = performance.now();
+    this.state.startTime = now + this.countInBeats * this.getBeatIntervalMs();
 
-    // Play first beat immediately
+    // Play first count-in beat immediately
     await this.playClick();
-    this.callbacks.onBeat?.(0, this.state.startTime);
-    this.nextScheduledBeat = 1;
+    this.callbacks.onCountIn?.(this.state.countInBeatsRemaining);
+    this.nextScheduledBeat = -this.countInBeats + 1;
 
     // Start the tick loop
     this.tickInterval = setInterval(() => this.tick(), TICK_INTERVAL_MS);
@@ -98,6 +131,8 @@ export class Metronome {
     this.state.isPlaying = false;
     this.state.startTime = null;
     this.state.currentBeat = 0;
+    this.state.isCountingIn = false;
+    this.state.countInBeatsRemaining = 0;
 
     if (this.tickInterval) {
       clearInterval(this.tickInterval);
@@ -117,9 +152,23 @@ export class Metronome {
       this.state.currentBeat = this.nextScheduledBeat;
       this.nextScheduledBeat++;
 
-      // Play sound and notify
+      // Play sound
       await this.playClick();
-      this.callbacks.onBeat?.(this.state.currentBeat, nextBeatTime);
+
+      // Check if we're still in count-in or playing
+      if (this.state.currentBeat < 0) {
+        // Still counting in
+        this.state.countInBeatsRemaining = Math.abs(this.state.currentBeat);
+        this.callbacks.onCountIn?.(this.state.countInBeatsRemaining);
+      } else {
+        // Regular beat - first one triggers count-in complete
+        if (this.state.isCountingIn) {
+          this.state.isCountingIn = false;
+          this.state.countInBeatsRemaining = 0;
+          this.callbacks.onCountInComplete?.();
+        }
+        this.callbacks.onBeat?.(this.state.currentBeat, nextBeatTime);
+      }
     }
   }
 

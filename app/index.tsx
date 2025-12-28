@@ -4,12 +4,13 @@ import {
   Text,
   StyleSheet,
   TouchableOpacity,
-  SafeAreaView,
   StatusBar,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { BpmSelector } from '../components/BpmSelector';
 import { TapZone } from '../components/TapZone';
 import { AccuracyDisplay } from '../components/AccuracyDisplay';
+import { CalibrationOverlay } from '../components/CalibrationOverlay';
 import { Metronome } from '../lib/metronome';
 import {
   calculateTimingOffset,
@@ -19,12 +20,20 @@ import {
 
 const clickSound = require('../assets/click.mp3');
 
+// Default audio latency - will be replaced by calibration
+const DEFAULT_AUDIO_LATENCY_MS = 0;
+
 export default function GameScreen() {
   const [bpm, setBpm] = useState(90);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isCountingIn, setIsCountingIn] = useState(false);
+  const [countInBeats, setCountInBeats] = useState(0);
   const [lastOffset, setLastOffset] = useState<number | null>(null);
   const [offsets, setOffsets] = useState<number[]>([]);
   const [currentBeat, setCurrentBeat] = useState(0);
+  const [audioLatency, setAudioLatency] = useState(DEFAULT_AUDIO_LATENCY_MS);
+  const [isCalibrating, setIsCalibrating] = useState(false);
+  const [isCalibrated, setIsCalibrated] = useState(false);
 
   const metronomeRef = useRef<Metronome | null>(null);
 
@@ -34,9 +43,17 @@ export default function GameScreen() {
     metronomeRef.current = metronome;
 
     metronome.initialize();
+    metronome.setAudioLatency(audioLatency);
     metronome.setCallbacks({
       onBeat: (beatNumber) => {
         setCurrentBeat(beatNumber);
+      },
+      onCountIn: (beatsRemaining) => {
+        setCountInBeats(beatsRemaining);
+      },
+      onCountInComplete: () => {
+        setIsCountingIn(false);
+        setCountInBeats(0);
       },
     });
 
@@ -44,6 +61,11 @@ export default function GameScreen() {
       metronome.cleanup();
     };
   }, []);
+
+  // Update audio latency when changed
+  useEffect(() => {
+    metronomeRef.current?.setAudioLatency(audioLatency);
+  }, [audioLatency]);
 
   // Update BPM when changed
   useEffect(() => {
@@ -57,6 +79,7 @@ export default function GameScreen() {
     setLastOffset(null);
     setOffsets([]);
     setCurrentBeat(0);
+    setIsCountingIn(true);
 
     await metronomeRef.current.start();
     setIsPlaying(true);
@@ -67,13 +90,19 @@ export default function GameScreen() {
 
     metronomeRef.current.stop();
     setIsPlaying(false);
+    setIsCountingIn(false);
+    setCountInBeats(0);
   }, []);
 
   const handleTap = useCallback(
     (tapTime: number) => {
       if (!metronomeRef.current) return;
 
-      const startTime = metronomeRef.current.getStartTime();
+      // Don't count taps during count-in
+      if (metronomeRef.current.isCountingIn()) return;
+
+      // Use adjusted start time that accounts for audio latency
+      const startTime = metronomeRef.current.getAdjustedStartTime();
       if (startTime === null) return;
 
       const beatIntervalMs = bpmToIntervalMs(bpm);
@@ -84,6 +113,16 @@ export default function GameScreen() {
     },
     [bpm]
   );
+
+  const handleCalibrationComplete = useCallback((latencyMs: number) => {
+    setAudioLatency(latencyMs);
+    setIsCalibrated(true);
+    setIsCalibrating(false);
+  }, []);
+
+  const handleCalibrationCancel = useCallback(() => {
+    setIsCalibrating(false);
+  }, []);
 
   const averageOffset = calculateAverageOffset(offsets);
 
@@ -100,6 +139,29 @@ export default function GameScreen() {
       {/* BPM Control */}
       <BpmSelector bpm={bpm} onBpmChange={setBpm} disabled={isPlaying} />
 
+      {/* Calibration Button */}
+      {!isPlaying && (
+        <View style={styles.calibrationSection}>
+          {isCalibrated ? (
+            <Text style={styles.calibratedText}>
+              Latency: {audioLatency}ms
+            </Text>
+          ) : (
+            <Text style={styles.notCalibratedText}>
+              Not calibrated
+            </Text>
+          )}
+          <TouchableOpacity
+            style={styles.calibrateButton}
+            onPress={() => setIsCalibrating(true)}
+          >
+            <Text style={styles.calibrateButtonText}>
+              {isCalibrated ? 'Recalibrate' : 'Calibrate'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
       {/* Start/Stop Button */}
       <TouchableOpacity
         style={[styles.startButton, isPlaying && styles.stopButton]}
@@ -110,10 +172,14 @@ export default function GameScreen() {
         </Text>
       </TouchableOpacity>
 
-      {/* Beat indicator */}
+      {/* Count-in or Beat indicator */}
       {isPlaying && (
         <View style={styles.beatIndicator}>
-          <Text style={styles.beatText}>Beat {currentBeat + 1}</Text>
+          {isCountingIn ? (
+            <Text style={styles.countInText}>{countInBeats}</Text>
+          ) : (
+            <Text style={styles.beatText}>Beat {currentBeat + 1}</Text>
+          )}
         </View>
       )}
 
@@ -125,7 +191,16 @@ export default function GameScreen() {
       />
 
       {/* Tap Zone */}
-      <TapZone onTap={handleTap} isActive={isPlaying} />
+      <TapZone onTap={handleTap} isActive={isPlaying && !isCountingIn} />
+
+      {/* Calibration Overlay */}
+      {isCalibrating && (
+        <CalibrationOverlay
+          audioSource={clickSound}
+          onCalibrationComplete={handleCalibrationComplete}
+          onCancel={handleCalibrationCancel}
+        />
+      )}
     </SafeAreaView>
   );
 }
@@ -172,10 +247,40 @@ const styles = StyleSheet.create({
   beatIndicator: {
     alignItems: 'center',
     paddingVertical: 8,
+    minHeight: 50,
   },
   beatText: {
     fontSize: 16,
     color: '#666',
     fontVariant: ['tabular-nums'],
+  },
+  countInText: {
+    fontSize: 36,
+    fontWeight: '700',
+    color: '#facc15',
+  },
+  calibrationSection: {
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
+  calibratedText: {
+    fontSize: 12,
+    color: '#4ade80',
+    marginBottom: 8,
+  },
+  notCalibratedText: {
+    fontSize: 12,
+    color: '#f87171',
+    marginBottom: 8,
+  },
+  calibrateButton: {
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    backgroundColor: '#2a2a4a',
+    borderRadius: 8,
+  },
+  calibrateButtonText: {
+    fontSize: 14,
+    color: '#888',
   },
 });
